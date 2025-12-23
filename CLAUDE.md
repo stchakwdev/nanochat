@@ -364,19 +364,36 @@ python -m scripts.upload_to_hf --repo_id=username/nanochat-d26-kan --source=base
 #   --step          Specific checkpoint step (default: latest)
 ```
 
+### KAN-Specific Memory Requirements
+
+KAN layers use significantly more VRAM than standard MLPs due to spline basis computation.
+
+**Tested Batch Sizes on H200 (143GB VRAM):**
+
+| Model | Batch Size | Peak VRAM | Status |
+|-------|-----------|-----------|--------|
+| d20 KAN | 8 | 105GB (73%) | Works |
+| d20 KAN | 16 | >143GB | OOM |
+| d26 KAN | 4 | 78GB (54%) | Works |
+| d26 KAN | 8 | 135GB (94%) | Works |
+
+**Recommended Settings:**
+- d20 KAN: `device_batch_size=8` max
+- d26 KAN: `device_batch_size=8` (tight) or `device_batch_size=4` (safe)
+
 ### RunPod H200 Training Plan
 
-**Target Model:** d26 (~750M params) Hybrid KAN-Transformer
+**Target Model:** d26 (~1.49B params with KAN) Hybrid KAN-Transformer
 
-**Cost Estimate:** ~$25-35 USD
-- H200 on-demand: ~$3.59/hr
-- Estimated runtime: 8-10 hours
-- Storage: 200GB Network Volume
+**Cost Estimate:** ~$150-200 USD for full training
+- 8x H200 on-demand: ~$28.72/hr
+- 1x H200 on-demand: ~$3.59/hr
+- Estimated runtime: 6-8 hours (8x H200)
 
 **Training Configuration:**
 ```bash
-DEPTH=26                    # ~750M params
-DEVICE_BATCH_SIZE=16        # Conservative for KAN memory usage
+DEPTH=26                    # ~1.49B params with KAN
+DEVICE_BATCH_SIZE=8         # Tested max for d26 KAN on H200
 LEARNING_RATE=1.5e-4        # Slightly lower for KAN stability
 GRAD_ACCUM=4                # Effective batch = 64
 NUM_SHARDS=300              # ~75B chars of training data
