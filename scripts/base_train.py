@@ -106,13 +106,15 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # -----------------------------------------------------------------------------
 # Initialize the Model
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
-with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
-model.to_empty(device=device)
+# Note: Meta device initialization disabled for KAN compatibility
+# KAN's curve2coeff uses torch.linalg.lstsq which doesn't support meta tensors
+model_config = GPTConfig(**model_config_kwargs)
+model = GPT(model_config)
+model = model.to(device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
+# Note: torch.compile disabled for KAN compatibility (Triton backend issues)
+# model = torch.compile(model, dynamic=False)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
