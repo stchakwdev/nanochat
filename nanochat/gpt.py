@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from efficient_kan import KAN
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
@@ -123,11 +124,35 @@ class MLP(nn.Module):
         return x
 
 
+class KAN_MLP(nn.Module):
+    """KAN-based MLP replacement for hybrid KAN-Transformer architecture."""
+    def __init__(self, config):
+        super().__init__()
+        # KAN: n_embd -> 4*n_embd -> n_embd (matches MLP expansion ratio)
+        self.kan = KAN([config.n_embd, 4 * config.n_embd, config.n_embd])
+        # Projection for residual connection (KAN output needs to match n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        # KAN expects (batch, features) but we have (batch, seq, features)
+        # Reshape: (B, T, C) -> (B*T, C) -> KAN -> (B*T, C) -> (B, T, C)
+        B, T, C = x.shape
+        x = x.view(B * T, C)
+        x = self.kan(x)
+        x = x.view(B, T, C)
+        x = self.c_proj(x)
+        return x
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        # Hybrid strategy: Last 2 layers use KAN
+        if layer_idx >= (config.n_layer - 2):
+            self.mlp = KAN_MLP(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
