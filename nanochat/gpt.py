@@ -9,20 +9,31 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Multi-Query Attention (MQA) support for more efficient inference
+- Optional KAN layers (Kolmogorov-Arnold Networks) for hybrid architecture
 """
 
 import math
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from efficient_kan import KAN
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+
+# Lazy import KAN to avoid import error when not using KAN
+_KAN = None
+def get_kan_class():
+    global _KAN
+    if _KAN is None:
+        from efficient_kan import KAN
+        _KAN = KAN
+    return _KAN
 
 @dataclass
 class GPTConfig:
@@ -32,6 +43,12 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    # KAN configuration
+    use_kan: bool = False  # Whether to use KAN layers
+    kan_layers: str = "last2"  # Which layers use KAN: none, last1, last2, first2, every4, middle2
+    kan_grid_size: int = 5  # KAN grid size (lower = less memory, faster)
+    # Training optimizations
+    use_grad_checkpoint: bool = False  # Gradient checkpointing for memory savings
 
 
 def norm(x):
@@ -128,8 +145,12 @@ class KAN_MLP(nn.Module):
     """KAN-based MLP replacement for hybrid KAN-Transformer architecture."""
     def __init__(self, config):
         super().__init__()
+        KAN = get_kan_class()
         # KAN: n_embd -> 4*n_embd -> n_embd (matches MLP expansion ratio)
-        self.kan = KAN([config.n_embd, 4 * config.n_embd, config.n_embd])
+        self.kan = KAN(
+            [config.n_embd, 4 * config.n_embd, config.n_embd],
+            grid_size=config.kan_grid_size
+        )
         # Projection for residual connection (KAN output needs to match n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
@@ -144,20 +165,55 @@ class KAN_MLP(nn.Module):
         return x
 
 
+def should_use_kan(layer_idx: int, n_layer: int, kan_layers: str) -> bool:
+    """Determine if a layer should use KAN based on configuration."""
+    if kan_layers == "none":
+        return False
+    elif kan_layers == "last1":
+        return layer_idx >= n_layer - 1
+    elif kan_layers == "last2":
+        return layer_idx >= n_layer - 2
+    elif kan_layers == "last4":
+        return layer_idx >= n_layer - 4
+    elif kan_layers == "first2":
+        return layer_idx < 2
+    elif kan_layers == "every4":
+        return layer_idx % 4 == 3  # layers 3, 7, 11, 15, ...
+    elif kan_layers == "middle2":
+        mid = n_layer // 2
+        return layer_idx in [mid - 1, mid]
+    elif kan_layers == "all":
+        return True
+    else:
+        raise ValueError(f"Unknown kan_layers: {kan_layers}")
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.use_grad_checkpoint = config.use_grad_checkpoint
         self.attn = CausalSelfAttention(config, layer_idx)
-        # Hybrid strategy: Last 2 layers use KAN
-        if layer_idx >= (config.n_layer - 2):
+        # Determine if this layer uses KAN
+        use_kan = config.use_kan and should_use_kan(layer_idx, config.n_layer, config.kan_layers)
+        if use_kan:
             self.mlp = KAN_MLP(config)
+            self.is_kan = True
         else:
             self.mlp = MLP(config)
+            self.is_kan = False
 
-    def forward(self, x, cos_sin, kv_cache):
+    def _forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
         x = x + self.mlp(norm(x))
         return x
+
+    def forward(self, x, cos_sin, kv_cache):
+        if self.use_grad_checkpoint and self.training and kv_cache is None:
+            # Gradient checkpointing: trade compute for memory
+            # Note: can't use with kv_cache during inference
+            return checkpoint(self._forward, x, cos_sin, kv_cache, use_reentrant=False)
+        return self._forward(x, cos_sin, kv_cache)
 
 
 class GPT(nn.Module):
@@ -194,6 +250,21 @@ class GPT(nn.Module):
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
+
+    def print_architecture_summary(self):
+        """Print a summary of the model architecture including KAN layers."""
+        kan_layers = [i for i, block in enumerate(self.transformer.h) if block.is_kan]
+        mlp_layers = [i for i, block in enumerate(self.transformer.h) if not block.is_kan]
+
+        print0(f"Architecture Summary:")
+        print0(f"  Total layers: {self.config.n_layer}")
+        print0(f"  MLP layers ({len(mlp_layers)}): {mlp_layers if len(mlp_layers) <= 10 else f'{mlp_layers[:5]}...{mlp_layers[-3:]}'}")
+        if kan_layers:
+            print0(f"  KAN layers ({len(kan_layers)}): {kan_layers}")
+            print0(f"  KAN grid_size: {self.config.kan_grid_size}")
+        else:
+            print0(f"  KAN layers: None (pure MLP)")
+        print0(f"  Gradient checkpointing: {self.config.use_grad_checkpoint}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

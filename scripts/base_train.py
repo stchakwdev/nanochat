@@ -37,6 +37,13 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+# KAN configuration
+use_kan = False # whether to use KAN layers (Kolmogorov-Arnold Networks)
+kan_layers = "last2" # which layers use KAN: none, last1, last2, last4, first2, every4, middle2, all
+kan_grid_size = 5 # KAN grid size (lower = less memory, faster; default=5)
+# Training optimizations
+use_grad_checkpoint = False # gradient checkpointing (trade compute for memory)
+compile_model = False # whether to use torch.compile (may not work with KAN)
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -105,16 +112,32 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(
+    sequence_len=max_seq_len,
+    vocab_size=vocab_size,
+    n_layer=num_layers,
+    n_head=num_heads,
+    n_kv_head=num_kv_heads,
+    n_embd=model_dim,
+    # KAN configuration
+    use_kan=use_kan,
+    kan_layers=kan_layers,
+    kan_grid_size=kan_grid_size,
+    # Training optimizations
+    use_grad_checkpoint=use_grad_checkpoint,
+)
 # Note: Meta device initialization disabled for KAN compatibility
 # KAN's curve2coeff uses torch.linalg.lstsq which doesn't support meta tensors
 model_config = GPTConfig(**model_config_kwargs)
 model = GPT(model_config)
 model = model.to(device)
 model.init_weights()
+model.print_architecture_summary()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
-# Note: torch.compile disabled for KAN compatibility (Triton backend issues)
-# model = torch.compile(model, dynamic=False)
+# Optional torch.compile (may not work with KAN due to Triton backend issues)
+if compile_model:
+    print0("Compiling model with torch.compile...")
+    model = torch.compile(model, dynamic=False)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
